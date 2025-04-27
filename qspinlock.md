@@ -1,7 +1,7 @@
 <!--
  * @Date: 2025-03-25
- * @LastEditors: error: git config user.name & please set dead value or install git
- * @LastEditTime: 2025-04-09
+ * @LastEditors: Goko Son
+ * @LastEditTime: 2025-04-25
  * @FilePath: /spinlock/qspinlock.md
  * @Description: 
 --> 
@@ -22,7 +22,7 @@
 diff --git a/arch/riscv/include/asm/spinlock_types.h b/arch/riscv/include/asm/spinlock_types.h
 index f398e76..d7b38bf 100644
 --- a/arch/riscv/include/asm/spinlock_types.h
-+++ b/arch/riscv/include/asm/spinlock_types.h
++++ b/arch/riscv/include/asm/spinlock_types.h 
 @@ -10,16 +10,21 @@
  # error "please don't include this file directly"
  #endif
@@ -41,46 +41,23 @@ index f398e76..d7b38bf 100644
 +	};
  } arch_spinlock_t;
 ```
-- 解决了公平问题，但所有核都轮询同一个owner，read cache line 成热点
+- 解决了公平问题，但所有核都轮询同一个owner变量，read cache line成热点，限制扩展性
 
 
-**MCS算法：**
+#### 3. MCS lock：
 
-- 每个线程在本地spin，无共享变量轮询（不像 classic/ticket 那样）
-
-**qspinlock：** 
-
-- 每个核只盯自己的局部变量排队，cache line 不共享，失效/嗅探最少
-
-
---- 
-
-**MCS锁**
-
-> 本质上是一种基于链表结构的自旋锁
-> 每个锁申请的过程中它在自己的本地的CPU变量上去自旋，而不是像经典的spinlock实现一样在全局的变量中自旋
-
-1. MCS锁基于链表结构的自旋锁，锁本身是一个 atomic_mcs_node_t *lock 指针，指向MCS链表的末尾。
-2. 每个CPU有一个对应的节点，节点包含lock成员，CPU在节点上自选等待锁。
-3. 当CPU持有锁时，其他CPU来申请锁时会依次排队，把自己的节点链接到当前CPU节点后面。
-4. 解锁时，当前CPU会把自己的节点从链表中摘除，并把锁传递给下一个节点。
+- 本质上是一种基于链表结构的自旋锁，每个CPU有一个对应的节点，基于各自不同的变量进行等待，那么每个CPU平时只需要查询自己对应的这个变量所在的本地cache line，仅在这个变量发生变化的时候，才需要读取内存和刷新这条cache line, 无共享变量轮询（不像 classic/ticket）
 ![alt text](image-1.png)
-- 每个 CPU 线程创建的 node 结构都是一样的，但它们是独立的，每个线程都有自己的 node 实例。
+```c
 typedef struct mcs_node {
      struct mcs_node *next;  // 指向下一个等待的线程
     bool locked;            // 是否持有锁
 } mcs_node_t;
+```
+- 每个 CPU 线程创建的 node 结构都是一样的，但它们是独立的，每个线程都有自己的 node 实例。
 
 
-**MCS算法**
-
-MCS 仍然是自旋锁，但每个线程只在自己的 mcs_node_t 变量上自旋，而不是共享变量 lock 上。
-这样避免了 多个 CPU 访问同一个锁变量导致的缓存一致性流量，即 避免了 CPU 间的“锁争夺”导致的总线流量问题。
-但是线程仍然在 CPU 上忙等，不会主动让出 CPU，因此 如果线程调度时间过长，仍然会造成 CPU 资源浪费。
-- MCS 的特点是：它优化了自旋锁的缓存一致性问题，但并不等于它是“阻塞锁”。
-
-
-## qspinlock
+#### 4. qspinlock
 **include/asm-generic/qspinlock_types.h:** 锁数据结构
 ```c
 typedef struct qspinlock {
@@ -143,7 +120,8 @@ typedef struct qspinlock {
 #define _Q_LOCKED_MASK          _Q_SET_MASK(LOCKED)
 ```
 ![alt text](image-2.png)
-
+- bit16-17: tail_index: 获取节点，目前Cpu支持4种节点(1234)
+- cpu编号，这里用来标识mcis链表末尾的节点
 
 **kernel/locking/mcs_spinlock.h**
 ```c
