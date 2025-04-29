@@ -1,7 +1,7 @@
 <!--
  * @Date: 2025-03-25
  * @LastEditors: Goko Son
- * @LastEditTime: 2025-04-25
+ * @LastEditTime: 2025-04-29
  * @FilePath: /spinlock/qspinlock.md
  * @Description: 
 --> 
@@ -55,7 +55,23 @@ typedef struct mcs_node {
 } mcs_node_t;
 ```
 - 每个 CPU 线程创建的 node 结构都是一样的，但它们是独立的，每个线程都有自己的 node 实例。
+原始 MCS 自旋锁的设计逻辑是这样的：
 
+每个抢锁的线程/CPU 都要 动态分配一个 node（结构体）
+
+这个 node 通过 node->next 挂在 锁结构的链表上
+
+锁本体结构如下：
+
+c
+复制代码
+struct mcs_spinlock {
+    struct mcs_spinlock *next;
+    int locked;
+};
+所以：每个锁有自己独立的链表结构，每个竞争者分配 node，并挂在这个锁上。
+
+如果系统上有很多锁，那么每个锁都要维护这样一个链表结构，这就是原始 MCS 最大的“内存开销问题”。
 
 #### 4. qspinlock
 **include/asm-generic/qspinlock_types.h:** 锁数据结构
@@ -155,20 +171,44 @@ struct qnode {
  */
 static DEFINE_PER_CPU_ALIGNED(struct qnode, qnodes[MAX_NODES]);
 ```
+- 嵌套四种上下文情况下的锁，例：进程上下文中发生中断再次获取锁
+
+
+
 **申请锁：**
 **include/asm-generic/qspinlock.h**
-![CPU快速申请通道](image-3.png):try_cmpxchg
-![CPU中速申请通道](image-4.png):slowpatch-> kerner/locking/qspinlock.c
-val & ~Q_LOCKED_MASK:tail(true) ->  goto queue
-否则，queue中为空，当前cpu直接为队列头->  locked = 1,返回lockval旧值
-检查中间是否有其它cpu进入
+![CPU快速申请](image-3.png)
+```c
+/**
+ * queued_spin_lock - acquire a queued spinlock
+ * @lock: Pointer to queued spinlock structure
+ */
+static __always_inline void queued_spin_lock(struct qspinlock *lock)
+{
+	int val = 0;
+
+	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL)))
+		return;
+
+	queued_spin_lock_slowpath(lock, val);
+}
+```
+![CPU中速申请](image-4.png)
+
+- 快速申请失败，queue中为空时，设置锁的pending位
+- 再次检测（检查中间是否有其它cpu进入）
+- 一直循环检测locked位
+- 清除pending位
+
+
+
 ![alt text](image-5.png)
 0,1,1(自旋等待锁) ->  0,0,1(得到锁)：退出循环
 
 | 申请         | 操作                                                                                                                                                |
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 快速申请通道 | 这个锁当前没有人持有，直接通过cmpxchg()设置locked域即可获取了锁。                                                                                   |
-| 中速申请通道 | 锁已经被人持有，但是MCS链表没有其他人，有且仅有一个人在等待这个锁。设置pending域，表示是第一顺位继承者，自旋等待lock-> locked清0，即锁持有者释放锁。 |
+| 快速申请 | 这个锁当前没有人持有，直接通过cmpxchg()设置locked域即可获取了锁。                                                                                   |
+| 中速申请 | 锁已经被人持有，但是MCS链表没有其他人，有且仅有一个人在等待这个锁。设置pending域，表示是第一顺位继承者，自旋等待lock-> locked清0，即锁持有者释放锁。 |
 
 
 
