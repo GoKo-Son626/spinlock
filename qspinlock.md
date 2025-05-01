@@ -1,7 +1,7 @@
 <!--
  * @Date: 2025-03-25
  * @LastEditors: Goko Son
- * @LastEditTime: 2025-04-29
+ * @LastEditTime: 2025-04-30
  * @FilePath: /spinlock/qspinlock.md
  * @Description: 
 --> 
@@ -47,31 +47,16 @@ index f398e76..d7b38bf 100644
 #### 3. MCS lock：
 
 - 本质上是一种基于链表结构的自旋锁，每个CPU有一个对应的节点，基于各自不同的变量进行等待，那么每个CPU平时只需要查询自己对应的这个变量所在的本地cache line，仅在这个变量发生变化的时候，才需要读取内存和刷新这条cache line, 无共享变量轮询（不像 classic/ticket）
-![alt text](image-1.png)
+
 ```c
-typedef struct mcs_node {
-     struct mcs_node *next;  // 指向下一个等待的线程
-    bool locked;            // 是否持有锁
-} mcs_node_t;
-```
-- 每个 CPU 线程创建的 node 结构都是一样的，但它们是独立的，每个线程都有自己的 node 实例。
-原始 MCS 自旋锁的设计逻辑是这样的：
-
-每个抢锁的线程/CPU 都要 动态分配一个 node（结构体）
-
-这个 node 通过 node->next 挂在 锁结构的链表上
-
-锁本体结构如下：
-
-c
-复制代码
 struct mcs_spinlock {
-    struct mcs_spinlock *next;
-    int locked;
+	struct mcs_spinlock *next;
+	int locked; /* 1 if lock acquired */
+	int count;  /* nesting count, see qspinlock.c */
 };
-所以：每个锁有自己独立的链表结构，每个竞争者分配 node，并挂在这个锁上。
+```
+- 每个 CPU 线程创建的 node 结构都是一样的，但它们是独立的，每个线程都有自己的 node 实例。“内存开销问题”
 
-如果系统上有很多锁，那么每个锁都要维护这样一个链表结构，这就是原始 MCS 最大的“内存开销问题”。
 
 #### 4. qspinlock
 **include/asm-generic/qspinlock_types.h:** 锁数据结构
@@ -209,6 +194,14 @@ static __always_inline void queued_spin_lock(struct qspinlock *lock)
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 快速申请 | 这个锁当前没有人持有，直接通过cmpxchg()设置locked域即可获取了锁。                                                                                   |
 | 中速申请 | 锁已经被人持有，但是MCS链表没有其他人，有且仅有一个人在等待这个锁。设置pending域，表示是第一顺位继承者，自旋等待lock-> locked清0，即锁持有者释放锁。 |
+|慢速申请| 进入到queue中自旋等待
+
+
+- 如果只有1个或2个CPU试图获取锁，那么只需要一个4字节的qspinlock就可以了，其所占内存的大小和ticket spinlock一样。当有3个以上的CPU试图获取锁，需要一个qspinlock加上(N-2)个MCS node。
+在大多数情况下，锁的争抢都不应该太激烈，最大概率是只有1个CPU试图获得锁，其次是2个，依次递减。
+
+- 这也是qspinlock中加入"pending"位域的意义，如果是两个CPU试图获取锁，那么第二个CPU只需要简单地设置"pending"为1，而不用创建一个MCS node。这是另一个优化。
+- 试图加锁的CPU数目超过3个，使用ticket spinlock机制就会造成多个CPU的cache line刷新的问题，而qspinlock可以利用MCS node队列来解决这个问题。
 
 
 
@@ -216,21 +209,4 @@ static __always_inline void queued_spin_lock(struct qspinlock *lock)
 
 
 - val == _Q_PENDING_VAL:0,1,0 ->  锁处于临界状态，锁的持有者正在释放锁
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-qspinlock的研究（尽量贴近risc-v，从使用者和开发者的角度进行深入研究）
-
 
