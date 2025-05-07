@@ -2,7 +2,7 @@
 
 #### 1. 传统spinlock：
 
-- 传统的spinlock有公平性问题.，缓存一致性开销，CPU核心越大，cache需求越厉害，缺乏可扩展性
+- 多个等待的 CPU 核心中，谁先获得锁并无保证，存在公平性问题，同时缓存一致性开销大（如MESI），CPU核心越大，cache需求越厉害，缺乏可扩展性
 
 ![alt text](https://raw.githubusercontent.com/GoKo-Son626/my-blog_images/main/spinlock/image-8.png)
 #### 2. Ticket spinlock
@@ -205,20 +205,21 @@ static __always_inline void queued_spin_lock(struct qspinlock *lock)
 
 | 申请         | 操作                                                                                                                                                |
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 快速申请 | 这个锁当前没有人持有，直接通过cmpxchg()设置locked域即可获取了锁。                                                                                   |
-| 中速申请 | 锁已经被人持有，但是MCS链表没有其他人，有且仅有一个人在等待这个锁。设置pending域，表示是第一顺位继承者，自旋等待lock-> locked清0，即锁持有者释放锁。 |
-|慢速申请| 进入到queue中自旋等待
+| 快速申请 | 这个锁当前没有人持有，直接通过cmpxchg()设置locked域即可获取了锁                                                                                   |
+| 中速申请 | 锁已经被人持有，但是MCS链表没有其他人，有且仅有一个人在等待这个锁。设置pending域，表示是第一顺位继承者，自旋等待lock-> locked清0，即锁持有者释放锁 |
+|慢速申请| 进入到queue中自旋等待，若为队列头（队列中没有等待的cpu），说明它已排到最前，可以开始尝试获取锁；否则，它会自旋等待前一个节点释放锁，并通知它可以尝试获取锁了
 
 
 **end:**
-- 如果只有1个或2个CPU试图获取锁，那么只需要一个4字节的qspinlock就可以了，其所占内存的大小和ticket spinlock一样。当有3个以上的CPU试图获取锁，需要一个qspinlock加上(N-2)个MCS node
+- 如果只有1个或2个CPU试图获取锁，那么只需要一个4字节的qspinlock就可以了，其所占内存的大小和ticket spinlock一样。当有3个以上的CPU试图获取锁，则需要(N-2)个MCS node
 
 - qspinlock中加入"pending"位域的意义，如果是两个CPU试图获取锁，那么第二个CPU只需要简单地设置"pending"为1，而不用创建一个MCS node
 
 - 试图加锁的CPU数目超过3个，使用ticket spinlock机制就会造成多个CPU的cache line刷新的问题，而qspinlock可以利用MCS node队列来解决这个问题
+  
+- 在多核争用严重场景下，qspinlock 让等待者在本地内存区域自旋，减少了锁的缓存抖动和对总线的竞争消耗
 
-- 从ticket spinlock到MCS lock，再到qspinlock，是对其一步步的优化的
+- RISCV_QUEUED_SPINLOCKS 只应在平台具有 Zabha 或 Ziccrse 时启用，不支持的情况不要选用
 
-
-
+- 优先级反转问题，queue会保证了FIFO提高了公平性，但它无法感知任务的优先级，可能因为排在队列前方的低优先级任务未释放锁而发生等待，从而导致 优先级反转
 
