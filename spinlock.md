@@ -4,8 +4,7 @@
 
 - 传统的spinlock有公平性问题.，缓存一致性开销，CPU核心越大，cache需求越厉害，缺乏可扩展性
 
-![alt text](image-8.png)
-
+![alt text](https://raw.githubusercontent.com/GoKo-Son626/my-blog_images/main/spinlock/image-8.png)
 #### 2. Ticket spinlock
 ```c
 #define TICKET_NEXT	16
@@ -123,7 +122,9 @@ typedef struct qspinlock {
 #define _Q_LOCKED_BITS          8
 #define _Q_LOCKED_MASK          _Q_SET_MASK(LOCKED)
 ```
-![alt text](image-7.png)
+
+**When NR_CPUS < 16K：**
+![alt text](https://raw.githubusercontent.com/GoKo-Son626/my-blog_images/main/spinlock/image-7.png)
 - `locked`：用来表示这个锁是否被人持有（0：无，1：有）
 - `pending`：可以理解为最优先持锁位，即当unlock之后只有这个位的CPU最先持锁，也有1和0
 - `tail`：有idx+CPU构成，用来标识等待队列的最后一个节点。
@@ -163,8 +164,8 @@ struct qnode {
  */
 static DEFINE_PER_CPU_ALIGNED(struct qnode, qnodes[MAX_NODES]);
 ```
-- 一个 CPU 上可能嵌套多个锁, 针对四种上下文情况下，例：进程上下文中发生中断后再次获取锁
-- PER_CPU的优点是快，防止抢锁时再mallock或临时分配导致延迟，成本等问题
+- 一个 CPU 上可能嵌套多个锁, `qnodes`针对四种上下文情况下，例：进程上下文中发生中断后再次获取锁
+- PER_CPU的优点是快，可防止抢锁时再mallock或临时分配导致延迟，成本等问题
 
 
 **申请锁：**
@@ -186,20 +187,20 @@ static __always_inline void queued_spin_lock(struct qspinlock *lock)
 	queued_spin_lock_slowpath(lock, val);
 }
 ```
-![alt text](image-9.png)
+![alt text](https://raw.githubusercontent.com/GoKo-Son626/my-blog_images/main/spinlock/image-9.png)
 
 2. 中速申请
 
 - 快速申请失败，queue中为空时，设置锁的pending位
 - 再次检测（检查中间是否有其它cpu进入）
 - 一直循环检测locked位
-- 清除pending位
-- 
-![alt text](image-11.png)
+- 当locked位为0时，清除pending位获得锁
+
+![alt text](https://raw.githubusercontent.com/GoKo-Son626/my-blog_images/main/spinlock/image-11.png)
 
 3. 慢速申请
 
-![alt text](image-12.png)
+![alt text](https://raw.githubusercontent.com/GoKo-Son626/my-blog_images/main/spinlock/image-12.png)
 
 
 | 申请         | 操作                                                                                                                                                |
