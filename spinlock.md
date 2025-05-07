@@ -1,52 +1,36 @@
-<!--
- * @Date: 2025-03-25
- * @LastEditors: Goko Son
- * @LastEditTime: 2025-04-30
- * @FilePath: /spinlock/qspinlock.md
- * @Description: 
---> 
 ## spinlock
 
-原子操作几乎是基于硬件实现的，但是保护的范围有限，比如CAS指令最大支持64bit（8字节大小），但是实际链表，二叉树等操作集合很大，对其操作是一个过程，不适合，自旋锁会让内核代码路径（进程或中断处理程序）自旋等待，锁可以分为两种：**忙等待和睡眠等待**，自旋锁的临界区中的代码要尽快执行完成，不能调度或者睡眠，自旋锁可以在（软，硬件，不可屏蔽）中断上下文或进程上下文使用，即CPU只能在自旋锁的临界区里面执行。
+#### 1. 传统spinlock：
 
+- 传统的spinlock有公平性问题.，缓存一致性开销，CPU核心越大，cache需求越厉害，缺乏可扩展性
 
-#### 1. spinlock：
+![alt text](image-8.png)
 
-- 有公平性问题，缓存一致性开销，CPU核心越大，cache需求越厉害，缺乏可扩展性
+#### 2. Ticket spinlock
+```c
+#define TICKET_NEXT	16
 
-假设CPU0....同时抢占一个经典的spinlock锁
-![alt text](image-6.png)
+typedef struct {
+	union {
+		u32 lock;
+		struct __raw_tickets {
+			/* little endian */
+			u16 owner;
+			u16 next;
+		} tickets;
+	};
+} arch_spinlock_t;
 
-#### 2. Ticket spinlock：
-```diff
-diff --git a/arch/riscv/include/asm/spinlock_types.h b/arch/riscv/include/asm/spinlock_types.h
-index f398e76..d7b38bf 100644
---- a/arch/riscv/include/asm/spinlock_types.h
-+++ b/arch/riscv/include/asm/spinlock_types.h 
-@@ -10,16 +10,21 @@
- # error "please don't include this file directly"
- #endif
- 
-+#define TICKET_NEXT	16
-+
- typedef struct {
--	volatile unsigned int lock;
-+	union {
-+		u32 lock;
-+		struct __raw_tickets {
-+			/* little endian */
-+			u16 owner;
-+			u16 next;
-+		} tickets;
-+	};
- } arch_spinlock_t;
+my_ticket = atomic_fetch_inc(&lock->tickets.next);
+
+ while (lock->tickets.owner != my_ticket)
+    cpu_relax();
 ```
-- 解决了公平问题，但所有核都轮询同一个owner变量，read cache line成热点，限制扩展性
+- 解决了公平问题，防止某些 CPU 永远得不到锁，但所有核都轮询同一个owner变量，read cache line成热点，限制扩展性
 
+#### 3. MCS lock
 
-#### 3. MCS lock：
-
-- 本质上是一种基于链表结构的自旋锁，每个CPU有一个对应的节点，基于各自不同的变量进行等待，那么每个CPU平时只需要查询自己对应的这个变量所在的本地cache line，仅在这个变量发生变化的时候，才需要读取内存和刷新这条cache line, 无共享变量轮询（不像 classic/ticket）
+- 本质上是一种基于链表结构的自旋锁，每个CPU有一个对应的节点(锁的副本)，基于各自不同的副本变量进行等待，锁本身是共享的，但队列节点是线程自己维护的，每个CPU只需要查询自己对应的本地cache line，仅在这个变量发生变化的时候，才需要读取内存和刷新这条cache line, 不像 classic/ticket对共享变量进行spin
 
 ```c
 struct mcs_spinlock {
@@ -54,8 +38,27 @@ struct mcs_spinlock {
 	int locked; /* 1 if lock acquired */
 	int count;  /* nesting count, see qspinlock.c */
 };
+
+static inline
+void mcs_spin_lock(struct mcs_spinlock **lock, struct mcs_spinlock *node)
+{
+	struct mcs_spinlock *prev;
+
+	/* Init node */
+	node->locked = 0;
+	node->next   = NULL;
+
+	prev = xchg(lock, node);
+	if (likely(prev == NULL)) {
+		return;
+	}
+	WRITE_ONCE(prev->next, node);
+
+	/* Wait until the lock holder passes the lock down. */
+	arch_mcs_spin_lock_contended(&node->locked);
+}
 ```
-- 每个 CPU 线程创建的 node 结构都是一样的，但它们是独立的，每个线程都有自己的 node 实例。“内存开销问题”
+- 每个 CPU 线程创建的node 是独立的，每个线程都有自己的 node 实例。但是结构体中多了一个指针使结构体变大了，导致了“内存开销问题”：MCS 锁把竞争带来的 cache-line 抖动降低了，但牺牲了一些内存和部分结构管理的成本。
 
 
 #### 4. qspinlock
@@ -120,9 +123,12 @@ typedef struct qspinlock {
 #define _Q_LOCKED_BITS          8
 #define _Q_LOCKED_MASK          _Q_SET_MASK(LOCKED)
 ```
-![alt text](image-2.png)
-- bit16-17: tail_index: 获取节点，目前Cpu支持4种节点(1234)
-- cpu编号，这里用来标识mcis链表末尾的节点
+![alt text](image-7.png)
+- `locked`：用来表示这个锁是否被人持有（0：无，1：有）
+- `pending`：可以理解为最优先持锁位，即当unlock之后只有这个位的CPU最先持锁，也有1和0
+- `tail`：有idx+CPU构成，用来标识等待队列的最后一个节点。
+- `tail_idx`：就是index，它作为mcs_nodes数组的下标使用
+- `tail_CPU`：用来表示CPU的编号+1，+1因为规定tail为0的时候表示等待队列中没有成员
 
 **kernel/locking/mcs_spinlock.h**
 ```c
@@ -132,8 +138,9 @@ struct mcs_spinlock {
         int count;  /* nesting count, see qspinlock.c */
 };
 ```
-`locked = 1`:只是说锁传到了当前加节点，但是当前节点还需要主动申请锁(qspinlock-> locked = 1)
-`count`：四种上下文
+`locked = 1`:只是说锁传到了当前加节点，但是当前节点还需要主动申请锁(qspinlock -> locked = 1)
+`count`：针对四种上下文用于追踪当前用了第几个 node（即 idx），最大为4,不够用时就fallback不排队直接自旋
+
 
 **kernel/locking/qspinlock.c:**
 ```c
@@ -156,13 +163,14 @@ struct qnode {
  */
 static DEFINE_PER_CPU_ALIGNED(struct qnode, qnodes[MAX_NODES]);
 ```
-- 嵌套四种上下文情况下的锁，例：进程上下文中发生中断再次获取锁
-
+- 一个 CPU 上可能嵌套多个锁, 针对四种上下文情况下，例：进程上下文中发生中断后再次获取锁
+- PER_CPU的优点是快，防止抢锁时再mallock或临时分配导致延迟，成本等问题
 
 
 **申请锁：**
+
+1. 快速申请
 **include/asm-generic/qspinlock.h**
-![CPU快速申请](image-3.png)
 ```c
 /**
  * queued_spin_lock - acquire a queued spinlock
@@ -178,17 +186,21 @@ static __always_inline void queued_spin_lock(struct qspinlock *lock)
 	queued_spin_lock_slowpath(lock, val);
 }
 ```
-![CPU中速申请](image-4.png)
+![alt text](image-9.png)
+
+2. 中速申请
 
 - 快速申请失败，queue中为空时，设置锁的pending位
 - 再次检测（检查中间是否有其它cpu进入）
 - 一直循环检测locked位
 - 清除pending位
+- 
+![alt text](image-11.png)
 
+3. 慢速申请
 
+![alt text](image-12.png)
 
-![alt text](image-5.png)
-0,1,1(自旋等待锁) ->  0,0,1(得到锁)：退出循环
 
 | 申请         | 操作                                                                                                                                                |
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -197,16 +209,15 @@ static __always_inline void queued_spin_lock(struct qspinlock *lock)
 |慢速申请| 进入到queue中自旋等待
 
 
-- 如果只有1个或2个CPU试图获取锁，那么只需要一个4字节的qspinlock就可以了，其所占内存的大小和ticket spinlock一样。当有3个以上的CPU试图获取锁，需要一个qspinlock加上(N-2)个MCS node。
-在大多数情况下，锁的争抢都不应该太激烈，最大概率是只有1个CPU试图获得锁，其次是2个，依次递减。
+**end:**
+- 如果只有1个或2个CPU试图获取锁，那么只需要一个4字节的qspinlock就可以了，其所占内存的大小和ticket spinlock一样。当有3个以上的CPU试图获取锁，需要一个qspinlock加上(N-2)个MCS node
 
-- 这也是qspinlock中加入"pending"位域的意义，如果是两个CPU试图获取锁，那么第二个CPU只需要简单地设置"pending"为1，而不用创建一个MCS node。这是另一个优化。
-- 试图加锁的CPU数目超过3个，使用ticket spinlock机制就会造成多个CPU的cache line刷新的问题，而qspinlock可以利用MCS node队列来解决这个问题。
+- qspinlock中加入"pending"位域的意义，如果是两个CPU试图获取锁，那么第二个CPU只需要简单地设置"pending"为1，而不用创建一个MCS node
+
+- 试图加锁的CPU数目超过3个，使用ticket spinlock机制就会造成多个CPU的cache line刷新的问题，而qspinlock可以利用MCS node队列来解决这个问题
+
+- 从ticket spinlock到MCS lock，再到qspinlock，是对其一步步的优化的
 
 
 
-
-
-
-- val == _Q_PENDING_VAL:0,1,0 ->  锁处于临界状态，锁的持有者正在释放锁
 
