@@ -1,4 +1,4 @@
-## spinlock
+## qspinlock
 
 #### 1. 传统spinlock：
 
